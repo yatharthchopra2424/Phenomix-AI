@@ -3,66 +3,27 @@ embedder.py
 ===========
 Convert text strings into dense embedding vectors.
 
-Primary:  NVIDIA nv-embedqa-e5-v5 via the NVIDIA API (openai-compatible).
-Fallback: sentence-transformers all-MiniLM-L6-v2 (local, offline).
-
-The embedder auto-selects the best available backend at startup and
-remains consistent within a single deployment.
+Primary:  sentence-transformers all-MiniLM-L6-v2 (local, offline).
+Fallback: deterministic hash embeddings (no external dependencies).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import hashlib
+from threading import Lock
 from typing import List
 
 logger = logging.getLogger(__name__)
 
-_backend: str = "unresolved"   # "nvidia" | "sentence_transformers"
 _st_model = None               # sentence-transformers model (if loaded)
-
-# ---------------------------------------------------------------------------
-# Backend detection
-# ---------------------------------------------------------------------------
-
-def _resolve_backend() -> str:
-    global _backend
-    if _backend != "unresolved":
-        return _backend
-
-    api_key = os.getenv("NVIDIA_API_KEY", "")
-    if api_key and not api_key.startswith("your_"):
-        _backend = "nvidia"
-    else:
-        _backend = "sentence_transformers"
-
-    logger.info("Embedder backend: %s", _backend)
-    return _backend
+_model_lock = Lock()
 
 
-# ---------------------------------------------------------------------------
-# NVIDIA embedding (calls /v1/embeddings via openai SDK)
-# ---------------------------------------------------------------------------
-
-def _embed_nvidia(texts: List[str]) -> List[List[float]]:
-    from openai import OpenAI  # type: ignore
-
-    client = OpenAI(
-        base_url = os.environ["NVIDIA_BASE_URL"],
-        api_key  = os.environ["NVIDIA_API_KEY"],
-    )
-    model = os.getenv("NVIDIA_EMBED_MODEL", "nvidia/nv-embedqa-e5-v5")
-
-    embeddings: List[List[float]] = []
-    # Process in batches of 10 (NVIDIA API limit)
-    batch_size = 10
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i : i + batch_size]
-        response = client.embeddings.create(model=model, input=batch)
-        for item in response.data:
-            embeddings.append(item.embedding)
-
-    return embeddings
+def _clean_env(name: str, default: str = "") -> str:
+    value = os.getenv(name, default)
+    return value.strip().strip('"').strip("'")
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +33,41 @@ def _embed_nvidia(texts: List[str]) -> List[List[float]]:
 def _embed_st(texts: List[str]) -> List[List[float]]:
     global _st_model
     if _st_model is None:
-        from sentence_transformers import SentenceTransformer  # type: ignore
-        _st_model = SentenceTransformer("all-MiniLM-L6-v2")
-        logger.info("sentence-transformers model loaded: all-MiniLM-L6-v2")
+        with _model_lock:
+            if _st_model is None:
+                from sentence_transformers import SentenceTransformer  # type: ignore
+                model_name = _clean_env("LOCAL_EMBED_MODEL", "all-MiniLM-L6-v2")
+                _st_model = SentenceTransformer(model_name)
+                logger.info("Embedder backend: sentence_transformers (%s)", model_name)
 
-    vecs = _st_model.encode(texts, show_progress_bar=False)
+    vecs = _st_model.encode(
+        texts,
+        batch_size=32,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    )
     return [v.tolist() for v in vecs]
+
+
+def _embed_hash(texts: List[str], dim: int = 256) -> List[List[float]]:
+    """Deterministic lightweight fallback embedder (no external deps)."""
+    vectors: List[List[float]] = []
+    for text in texts:
+        values = [0.0] * dim
+        for token in text.lower().split():
+            digest = hashlib.sha256(token.encode("utf-8", errors="ignore")).digest()
+            idx = int.from_bytes(digest[:2], "big") % dim
+            sign = 1.0 if digest[2] % 2 == 0 else -1.0
+            values[idx] += sign
+
+        norm = sum(v * v for v in values) ** 0.5
+        if norm > 0:
+            values = [v / norm for v in values]
+        vectors.append(values)
+
+    logger.warning("Embedding fallback active: deterministic hash vectors in use.")
+    return vectors
 
 
 # ---------------------------------------------------------------------------
@@ -86,14 +76,14 @@ def _embed_st(texts: List[str]) -> List[List[float]]:
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     """Return a list of embedding vectors, one per input text."""
-    backend = _resolve_backend()
-    try:
-        if backend == "nvidia":
-            return _embed_nvidia(texts)
-    except Exception as exc:
-        logger.warning("NVIDIA embedder failed (%s) — falling back to sentence-transformers.", exc)
+    if not texts:
+        return []
 
-    return _embed_st(texts)
+    try:
+        return _embed_st(texts)
+    except Exception as exc:
+        logger.warning("sentence-transformers embedder failed (%s) — falling back to hash embeddings.", exc)
+        return _embed_hash(texts)
 
 
 def embed_query(text: str) -> List[float]:

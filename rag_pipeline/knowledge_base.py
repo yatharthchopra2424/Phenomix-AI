@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+import hashlib
 from typing import List
 
 from rag_pipeline.chroma_client import get_collection, collection_is_empty
@@ -247,17 +248,32 @@ def seed_knowledge_base() -> None:
     Populate the ChromaDB pharma_guidelines collection with guideline chunks.
     Skipped if the collection already contains documents (idempotent).
     """
-    if not collection_is_empty():
-        logger.info("Knowledge base already seeded (%d docs). Skipping.", get_collection().count())
-        return
-
     collection = get_collection()
     texts     = [c["text"] for c in _CHUNKS]
     metadatas = [c["metadata"] for c in _CHUNKS]
-    ids       = [str(uuid.uuid4()) for _ in _CHUNKS]
+    ids = [
+        "guideline-" + hashlib.sha1(
+            f"{m.get('source_type','')}-{m.get('gene','')}-{m.get('drug','')}-{t[:80]}".encode("utf-8")
+        ).hexdigest()
+        for m, t in zip(metadatas, texts)
+    ]
 
-    logger.info("Embedding %d guideline chunks…", len(texts))
+    logger.info("Embedding %d guideline chunks for local vector store…", len(texts))
     embeddings = embed_texts(texts)
+
+    if hasattr(collection, "upsert"):
+        collection.upsert(
+            ids        = ids,
+            embeddings = embeddings,
+            documents  = texts,
+            metadatas  = metadatas,
+        )
+        logger.info("Knowledge base seeded/upserted successfully with %d chunks.", len(texts))
+        return
+
+    if not collection_is_empty():
+        logger.info("Knowledge base already contains documents (%d). Skipping add on non-upsert backend.", collection.count())
+        return
 
     collection.add(
         ids        = ids,
@@ -266,6 +282,77 @@ def seed_knowledge_base() -> None:
         metadatas  = metadatas,
     )
     logger.info("Knowledge base seeded successfully with %d chunks.", len(texts))
+
+
+def index_uploaded_case(
+    patient_id: str,
+    gene: str,
+    drug: str,
+    phenotype: str,
+    diplotype: str,
+    rsids: List[str],
+    vcf_preview: str,
+) -> int:
+    """
+    Index a compact, patient-specific chunk so uploaded-file context is retrievable.
+
+    Returns number of chunks inserted.
+    """
+    rsid_str = ", ".join(rsids) if rsids else "none"
+    cleaned_preview = (vcf_preview or "").strip()
+    if len(cleaned_preview) > 1600:
+        cleaned_preview = cleaned_preview[:1600]
+
+    case_summary = (
+        f"Uploaded case profile\n"
+        f"Patient: {patient_id}\n"
+        f"Gene: {gene}\n"
+        f"Drug: {drug.upper()}\n"
+        f"Diplotype: {diplotype}\n"
+        f"Phenotype: {phenotype}\n"
+        f"Detected rsIDs: {rsid_str}\n"
+    )
+
+    chunks = [case_summary]
+    metadatas = [{
+        "source_type": "UPLOADED_CASE",
+        "gene": gene,
+        "drug": drug.upper(),
+        "phenotype": phenotype,
+        "patient_id": patient_id,
+    }]
+
+    if cleaned_preview:
+        chunks.append(
+            "Uploaded VCF preview (truncated):\n"
+            f"{cleaned_preview}"
+        )
+        metadatas.append({
+            "source_type": "UPLOADED_VCF_PREVIEW",
+            "gene": gene,
+            "drug": drug.upper(),
+            "phenotype": phenotype,
+            "patient_id": patient_id,
+        })
+
+    embeddings = embed_texts(chunks)
+    ids = [str(uuid.uuid4()) for _ in chunks]
+
+    get_collection().add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=chunks,
+        metadatas=metadatas,
+    )
+
+    logger.info(
+        "Indexed uploaded case for %s (%s/%s): %d chunks.",
+        patient_id,
+        gene,
+        drug.upper(),
+        len(chunks),
+    )
+    return len(chunks)
 
 
 # Avoid circular import at module level

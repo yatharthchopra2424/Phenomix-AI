@@ -62,6 +62,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
+_STRICT_LLM_ONLY = os.getenv("STRICT_LLM_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +144,7 @@ async def predict(
         )
 
     patient_id = f"PATIENT_{vcf_file.filename or uuid.uuid4().hex[:8].upper()}"
+    vcf_text_preview = _build_vcf_preview(content)
     results: List[PredictResponse] = []
 
     for drug in drug_list:
@@ -167,6 +169,22 @@ async def predict(
         det_variants = _build_detected_variants(diplo_result.detected_variants, ml_results)
         rsids = [dv.rsid for dv in det_variants if dv.rsid and dv.rsid != "."]
 
+        # Index uploaded case context so file-derived content is retrievable
+        try:
+            from rag_pipeline.knowledge_base import index_uploaded_case
+            await asyncio.to_thread(
+                index_uploaded_case,
+                patient_id,
+                gene,
+                drug,
+                phenotype,
+                diplotype_str,
+                rsids,
+                vcf_text_preview,
+            )
+        except Exception as exc:
+            logger.warning("Uploaded case indexing skipped: %s", exc)
+
         # RAG retrieval
         rag_ok = True
         context_chunks: List[str] = []
@@ -183,7 +201,7 @@ async def predict(
         llm_ok = True
         llm_text = ""
         try:
-            from rag_pipeline.llm_engine import generate_explanation
+            from rag_pipeline.llm_engine import LLMUnavailableError, generate_explanation
             patient_profile = {
                 "gene":       gene,
                 "diplotype":  diplotype_str,
@@ -193,7 +211,21 @@ async def predict(
                 "rsids":      rsids,
             }
             llm_text = await asyncio.to_thread(
-                generate_explanation, context_chunks, patient_profile
+                generate_explanation, context_chunks, patient_profile, _STRICT_LLM_ONLY
+            )
+        except LLMUnavailableError as exc:
+            if _STRICT_LLM_ONLY:
+                logger.error("LLM required but unavailable: %s", exc)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"LLM output required but unavailable. {exc}",
+                )
+
+            logger.warning("LLM unavailable; returning fallback explanation: %s", exc)
+            llm_ok = False
+            llm_text = (
+                f"LLM unavailable. {risk_result.phenotype} {risk_result.risk_label} "
+                f"for {drug.title()} (gene: {gene}, diplotype: {diplotype_str})."
             )
         except Exception as exc:
             logger.error("LLM generation failed: %s", exc)
@@ -285,3 +317,11 @@ def _build_detected_variants(
             ml_confidence  = ml_conf,
         ))
     return dvs
+
+
+def _build_vcf_preview(content: bytes, max_lines: int = 40, max_chars: int = 1600) -> str:
+    """Extract a compact VCF preview for vector indexing."""
+    text = content.decode("utf-8", errors="replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    preview = "\n".join(lines[:max_lines])
+    return preview[:max_chars]

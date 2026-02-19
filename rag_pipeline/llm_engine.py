@@ -21,30 +21,84 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+class LLMUnavailableError(RuntimeError):
+    """Raised when LLM output is required but the remote LLM is unavailable."""
+
 # Colour support for thinking-block output in TTY environments
 _USE_COLOR      = sys.stdout.isatty() and os.getenv("NO_COLOR") is None
 _REASONING_COLOR = "\033[90m" if _USE_COLOR else ""
 _RESET_COLOR     = "\033[0m"  if _USE_COLOR else ""
+_nvidia_llm_auth_disabled: bool = False
+
+
+def _clean_env(name: str, default: str = "") -> str:
+    value = os.getenv(name, default)
+    return value.strip().strip('"').strip("'")
+
+
+def _is_auth_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in (401, 403):
+        return True
+
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None) in (401, 403):
+        return True
+
+    text = str(exc).lower()
+    return "403" in text or "401" in text or "forbidden" in text or "unauthor" in text
+
+
+def _should_use_nvidia_llm() -> bool:
+    if _nvidia_llm_auth_disabled:
+        return False
+
+    api_key = _clean_env("NVIDIA_API_KEY", "")
+    if not api_key or api_key.startswith("your_"):
+        return False
+
+    return True
+
+
+def _diagnose_nvidia_access() -> str:
+    """Return a short diagnostic string for NVIDIA API access state."""
+    try:
+        from openai import OpenAI  # type: ignore
+
+        client = OpenAI(
+            base_url = _clean_env("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+            api_key  = _clean_env("NVIDIA_API_KEY", ""),
+        )
+        models = client.models.list()
+        count = len(getattr(models, "data", []) or [])
+        return (
+            "NVIDIA API key is recognized (models list accessible), but inference is denied for this key/model. "
+            f"Visible models: {count}."
+        )
+    except Exception:
+        return "NVIDIA API key is not authorized for models list or is invalid."
+
+
+def _candidate_models() -> List[str]:
+    """Return ordered model fallback list for NVIDIA chat completions."""
+    primary = _clean_env("NVIDIA_MODEL", "z-ai/glm5")
+    fallback_env = _clean_env("NVIDIA_MODEL_FALLBACKS", "")
+    fallbacks = [item.strip() for item in fallback_env.split(",") if item.strip()]
+
+    ordered = [primary, *fallbacks, "openai/gpt-oss-120b"]
+    unique: List[str] = []
+    for model in ordered:
+        if model not in unique:
+            unique.append(model)
+    return unique
 
 
 # ---------------------------------------------------------------------------
 # System prompt template
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """You are a board-certified clinical pharmacogenomics consultant.
-
-Your task is to provide a clear, concise, and medically accurate explanation of a
-pharmacogenomic risk assessment for a healthcare provider.
-
-STRICT RULES:
-1. You MUST base every statement ONLY on the CPIC / PharmGKB guideline excerpts
-   provided below in the [CONTEXT] section.  Do NOT introduce any information that
-   is not explicitly present in the context.
-2. If the context does not contain enough information to answer a specific sub-question,
-   state "The retrieved guidelines do not address this specific case" rather than guessing.
-3. Cite specific rsIDs, star alleles, and Activity Scores when they appear in the context.
-4. Write for a clinician audience: precise but not excessively technical.
-5. Maximum 4 paragraphs.  Do not use bullet points.
+_SYSTEM_PROMPT = """You are a clinical pharmacogenomics system. Analyze the provided VCF variants, RAG guidelines, and Deep Learning risk scores. You MUST output your final analysis adhering strictly to the provided JSON schema. Do not output markdown, introductory text, or anything outside the JSON.
 
 [CONTEXT]
 {context}
@@ -76,6 +130,7 @@ Using ONLY the provided guideline context above, explain:
 def generate_explanation(
     context_chunks: List[str],
     patient_profile: Dict,
+    strict_llm: bool = False,
 ) -> str:
     """
     Call NVIDIA GLM5 with streaming to generate a RAG-grounded clinical explanation.
@@ -106,9 +161,35 @@ def generate_explanation(
         rsids      = rsids_str,
     )
 
+    global _nvidia_llm_auth_disabled
+
+    if not _should_use_nvidia_llm():
+        if strict_llm:
+            raise LLMUnavailableError(
+                "NVIDIA LLM unavailable: missing/invalid API configuration. " + _diagnose_nvidia_access()
+            )
+        return _fallback_explanation(patient_profile, context_chunks)
+
     try:
         return _call_nvidia_glm5(system_prompt, user_prompt)
     except Exception as exc:
+        if _is_auth_error(exc):
+            if not _nvidia_llm_auth_disabled:
+                logger.warning(
+                    "NVIDIA LLM authorization failed (%s). Disabling NVIDIA LLM for this process and using fallback explanation.",
+                    exc,
+                )
+            _nvidia_llm_auth_disabled = True
+            if strict_llm:
+                raise LLMUnavailableError(
+                    f"NVIDIA LLM authorization failed: {exc}. {_diagnose_nvidia_access()}"
+                ) from exc
+            return _fallback_explanation(patient_profile, context_chunks)
+
+        if strict_llm:
+            raise LLMUnavailableError(
+                f"NVIDIA LLM request failed: {exc}. {_diagnose_nvidia_access()}"
+            ) from exc
         logger.error("LLM call failed: %s", exc, exc_info=True)
         return _fallback_explanation(patient_profile, context_chunks)
 
@@ -118,51 +199,69 @@ def generate_explanation(
 # ---------------------------------------------------------------------------
 
 def _call_nvidia_glm5(system_prompt: str, user_prompt: str) -> str:
+    if _nvidia_llm_auth_disabled:
+        raise RuntimeError("NVIDIA LLM disabled due to prior authorization failure.")
+
     from openai import OpenAI  # type: ignore
 
     client = OpenAI(
-        base_url = os.environ.get("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-        api_key  = os.environ.get("NVIDIA_API_KEY", ""),
-    )
-    model = os.environ.get("NVIDIA_MODEL", "z-ai/glm5")
-
-    completion = client.chat.completions.create(
-        model    = model,
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-        temperature = 0.2,        # low temperature for factual clinical text
-        top_p       = 0.9,
-        max_tokens  = 1024,
-        extra_body  = {
-            "chat_template_kwargs": {
-                "enable_thinking": True,
-                "clear_thinking":  False,
-            }
-        },
-        stream = True,
+        base_url = _clean_env("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+        api_key  = _clean_env("NVIDIA_API_KEY", ""),
+        timeout  = 120.0,
     )
 
-    output_parts: List[str] = []
+    model_errors: List[str] = []
+    for model in _candidate_models():
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.60,
+                top_p=0.95,
+                max_tokens=2048,
+                stream=True,
+            )
 
-    for chunk in completion:
-        if not getattr(chunk, "choices", None):
+            output_parts: List[str] = []
+            reasoning_parts: List[str] = []
+
+            for chunk in completion:
+                if not getattr(chunk, "choices", None):
+                    continue
+                if not chunk.choices or chunk.choices[0].delta is None:
+                    continue
+                delta = chunk.choices[0].delta
+
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    logger.debug("%s<thinking>%s%s", _REASONING_COLOR, reasoning, _RESET_COLOR)
+                    reasoning_parts.append(str(reasoning))
+
+                content = getattr(delta, "content", None)
+                if content is not None:
+                    output_parts.append(str(content))
+
+            output_text = "".join(output_parts).strip()
+            if output_text:
+                logger.info("NVIDIA LLM model selected: %s", model)
+                return output_text
+
+            reasoning_text = "".join(reasoning_parts).strip()
+            if reasoning_text:
+                logger.info("NVIDIA LLM model selected (reasoning fallback): %s", model)
+                return reasoning_text
+
+            model_errors.append(f"{model}: empty response")
+            logger.warning("NVIDIA LLM model returned empty response: %s", model)
+        except Exception as exc:
+            model_errors.append(f"{model}: {exc}")
+            logger.warning("NVIDIA LLM model failed (%s): %s", model, exc)
             continue
-        if not chunk.choices or chunk.choices[0].delta is None:
-            continue
-        delta = chunk.choices[0].delta
 
-        # Reasoning tokens (printed to stderr in TTY — not included in output)
-        reasoning = getattr(delta, "reasoning_content", None)
-        if reasoning:
-            logger.debug("%s<thinking>%s%s", _REASONING_COLOR, reasoning, _RESET_COLOR)
-
-        # Main content tokens
-        if getattr(delta, "content", None) is not None:
-            output_parts.append(delta.content)
-
-    return "".join(output_parts).strip()
+    raise RuntimeError("All candidate NVIDIA models failed. " + " | ".join(model_errors))
 
 
 # ---------------------------------------------------------------------------
@@ -191,9 +290,17 @@ def _fallback_explanation(
     )
 
     if context_chunks:
-        # Append the first retrieved chunk as verbatim guideline reference
+        guideline_chunk = next(
+            (
+                chunk for chunk in context_chunks
+                if "cpic guideline" in chunk.lower() or "pharmgkb" in chunk.lower()
+            ),
+            context_chunks[0],
+        )
+
+        # Append a retrieved guideline-like reference snippet
         summary += (
-            f"\n\nRelevant CPIC guideline excerpt:\n{context_chunks[0][:600]}…"
+            f"\n\nRelevant CPIC guideline excerpt:\n{guideline_chunk[:600]}…"
         )
 
     return summary

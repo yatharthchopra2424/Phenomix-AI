@@ -68,31 +68,42 @@ def retrieve_context(
 
     # ── Dense retrieval with metadata filter ──────────────────────────────
     where_filter = _build_filter(gene, drug)
+    primary_filter = _build_primary_filter(gene, drug)
+
+    results = {"documents": [[]], "distances": [[]], "metadatas": [[]]}
+
+    # 1) Prefer authoritative guideline sources first
     try:
+        results = collection.query(
+            query_embeddings  = [query_vec],
+            n_results         = min(_TOP_K_DENSE, collection.count()),
+            where             = primary_filter,
+            include           = ["documents", "distances", "metadatas"],
+        )
+    except Exception as exc:
+        logger.warning("Primary filtered query failed (%s) — retrying with broad filter.", exc)
+
+    docs_primary: List[str] = results.get("documents", [[]])[0] if results.get("documents") else []
+
+    # 2) Fall back to broader gene/drug scope when needed
+    if not docs_primary:
         results = collection.query(
             query_embeddings  = [query_vec],
             n_results         = min(_TOP_K_DENSE, collection.count()),
             where             = where_filter,
             include           = ["documents", "distances", "metadatas"],
         )
-    except Exception as exc:
-        # Fall back without metadata filter if collection has no matching docs
-        logger.warning("Filtered query failed (%s) — retrying without filter.", exc)
-        results = collection.query(
-            query_embeddings = [query_vec],
-            n_results        = min(_TOP_K_DENSE, collection.count()),
-            include          = ["documents", "distances", "metadatas"],
-        )
 
-    docs:      List[str]   = results["documents"][0]   if results["documents"]  else []
-    distances: List[float] = results["distances"][0]   if results["distances"]  else []
+    docs:      List[str]             = results.get("documents", [[]])[0] if results.get("documents") else []
+    distances: List[float]           = results.get("distances", [[]])[0] if results.get("distances") else []
+    metadatas: List[Dict[str, str]]  = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
 
     if not docs:
         return []
 
     # ── BM25-style keyword re-ranking ─────────────────────────────────────
     keywords = _extract_keywords(gene, drug, diplotype, rsids or [])
-    scored   = _keyword_rerank(docs, distances, keywords)
+    scored   = _keyword_rerank(docs, distances, metadatas, keywords)
 
     top_chunks = [doc for doc, _ in scored[:_TOP_K_RETURN]]
 
@@ -137,6 +148,21 @@ def _build_filter(gene: str, drug: str) -> Dict:
     }
 
 
+def _build_primary_filter(gene: str, drug: str) -> Dict:
+    """
+    Prefer authoritative guideline sources (CPIC/PharmGKB) for first-pass retrieval.
+    """
+    drug_upper = drug.upper()
+    return {
+        "$or": [
+            {"gene": {"$eq": gene}, "source_type": {"$eq": "CPIC_Guideline"}},
+            {"drug": {"$eq": drug_upper}, "source_type": {"$eq": "CPIC_Guideline"}},
+            {"gene": {"$eq": gene}, "source_type": {"$eq": "PharmGKB"}},
+            {"drug": {"$eq": drug_upper}, "source_type": {"$eq": "PharmGKB"}},
+        ]
+    }
+
+
 def _extract_keywords(
     gene: str,
     drug: str,
@@ -155,6 +181,7 @@ def _extract_keywords(
 def _keyword_rerank(
     docs: List[str],
     distances: List[float],
+    metadatas: List[Dict[str, str]],
     keywords: List[str],
 ) -> List[tuple]:
     """
@@ -165,10 +192,21 @@ def _keyword_rerank(
     """
     kw_lower = [k.lower() for k in keywords]
     scored = []
-    for doc, dist in zip(docs, distances):
+    for idx, (doc, dist) in enumerate(zip(docs, distances)):
         doc_lower = doc.lower()
         hits  = sum(1 for kw in kw_lower if kw in doc_lower)
-        score = (1.0 - dist) + 0.1 * hits
+        metadata = metadatas[idx] if idx < len(metadatas) else {}
+        source_type = str(metadata.get("source_type", "")).upper()
+
+        source_boost = 0.0
+        if source_type == "CPIC_GUIDELINE":
+            source_boost = 0.60
+        elif source_type == "PHARMGKB":
+            source_boost = 0.40
+        elif source_type.startswith("UPLOADED_"):
+            source_boost = -0.80
+
+        score = (1.0 - dist) + (0.08 * hits) + source_boost
         scored.append((doc, score))
 
     scored.sort(key=lambda x: x[1], reverse=True)
