@@ -7,7 +7,6 @@ GET /api/health — liveness and readiness probe for the PharmaGuard backend.
 from fastapi import APIRouter
 
 from ml_models.predictor import is_loaded, is_demo_mode
-from rag_pipeline.chroma_client import get_collection
 
 router = APIRouter()
 
@@ -16,6 +15,7 @@ router = APIRouter()
 async def health_check():
     """Return service status and component readiness flags."""
     try:
+        from rag_pipeline.chroma_client import get_collection
         chroma_count = get_collection().count()
         chroma_ready = chroma_count > 0
     except Exception:

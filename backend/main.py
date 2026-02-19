@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv  # type: ignore
@@ -24,8 +25,16 @@ from fastapi.middleware.cors import CORSMiddleware
 # Load .env from project root (one level above this file's package)
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-from backend.api.health import router as health_router
-from backend.api.predict import router as predict_router
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+try:
+    from backend.api.health import router as health_router
+    from backend.api.predict import router as predict_router
+except ModuleNotFoundError:
+    from api.health import router as health_router
+    from api.predict import router as predict_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,8 +57,11 @@ async def lifespan(app: FastAPI):
     load_model()
 
     # 2. Initialise ChromaDB client + seed knowledge base if empty
-    from rag_pipeline.knowledge_base import seed_knowledge_base
-    seed_knowledge_base()
+    try:
+        from rag_pipeline.knowledge_base import seed_knowledge_base
+        seed_knowledge_base()
+    except Exception as exc:
+        logger.warning("RAG initialisation skipped: %s", exc)
 
     logger.info("All components initialised. Ready.")
     yield

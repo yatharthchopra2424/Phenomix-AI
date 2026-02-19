@@ -46,13 +46,16 @@ from genomics_engine.pgx_reference import DRUG_GENE_MAP
 
 from ml_models.predictor import predict_variant_function
 
-from rag_pipeline.retriever import retrieve_context
-from rag_pipeline.llm_engine import generate_explanation
-
-from backend.schemas.response import (
-    PredictResponse, RiskAssessment, PharmacoGenomicProfile,
-    ClinicalRecommendation, LLMExplanation, QualityMetrics, DetectedVariant,
-)
+try:
+    from backend.schemas.response import (
+        PredictResponse, RiskAssessment, PharmacoGenomicProfile,
+        ClinicalRecommendation, LLMExplanation, QualityMetrics, DetectedVariant,
+    )
+except ModuleNotFoundError:
+    from schemas.response import (
+        PredictResponse, RiskAssessment, PharmacoGenomicProfile,
+        ClinicalRecommendation, LLMExplanation, QualityMetrics, DetectedVariant,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +171,7 @@ async def predict(
         rag_ok = True
         context_chunks: List[str] = []
         try:
+            from rag_pipeline.retriever import retrieve_context
             context_chunks = await asyncio.to_thread(
                 retrieve_context, gene, drug, phenotype, diplotype_str, rsids
             )
@@ -179,6 +183,7 @@ async def predict(
         llm_ok = True
         llm_text = ""
         try:
+            from rag_pipeline.llm_engine import generate_explanation
             patient_profile = {
                 "gene":       gene,
                 "diplotype":  diplotype_str,
