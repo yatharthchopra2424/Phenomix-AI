@@ -1,0 +1,23 @@
+fastapi
+uvicorn
+python-multipart
+pydantic
+python-dotenv
+
+# VCF parsing
+# cyvcf2 is Linux/macOS only (htslib wrapper) — install in Docker/CI
+# cyvcf2>=0.31.0
+
+# Machine learning
+torch
+numpy
+
+# RAG / Vector database
+chromadb
+
+# Embeddings / LLM
+openai
+sentence-transformers
+
+# Utilities
+httpx
